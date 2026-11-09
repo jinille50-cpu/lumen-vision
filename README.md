@@ -1,6 +1,6 @@
 # Lumen app
 
-![Lumen app](docs/home.png)
+<img src="docs/home.png" alt="Lumen app" width="860">
 
 | 앱 | 하는 일 | 입력 | 결과 |
 | --- | --- | --- | --- |
@@ -24,7 +24,7 @@
 - 학습한 Segmentation, Object Detection 모델로 새 이미지에 1차 라벨링한 뒤, 점수 낮은 것부터 승인, 수정, 버리기. 고친 라벨로 다시 학습하는 반복에 맞춘 흐름
 - 초분광 큐브(mat, npy, hdr, h5, 다채널 tif)를 열어 밴드를 골라 false color로 보며 라벨링, 클래스별 평균 스펙트럼을 CSV로 저장
 
-![Labeler](docs/labeler.png)
+<img src="docs/labeler.png" alt="Labeler" width="860">
 
 ### HSI Viewer
 
@@ -36,7 +36,7 @@
 - 찾은 객체를 스펙트럼 특징으로 K개 그룹으로 분류. 방법(KMeans 등)과 객체, 픽셀, ROI 단위를 고를 수 있음
 - 결과를 CSV, 라벨 맵(npy), 오버레이 PNG로 저장
 
-![HSI Viewer](docs/hsi_viewer.png)
+<img src="docs/hsi_viewer.png" alt="HSI Viewer" width="498">
 
 ### Segmentation
 
@@ -48,7 +48,7 @@
 - 추론에서 폴더 이미지의 분할 결과와 오버레이 저장. 정답 라벨이 없는 이미지도 가능
 - 경량화에서 ONNX로 내보내고 INT8 양자화 후 FP32와 정확도 비교, 민감도 분석으로 양자화에서 뺄 레이어 고르기
 
-![Segmentation 학습](docs/segmentation_train.png)
+<img src="docs/segmentation_train.png" alt="Segmentation 학습" width="860">
 
 ### Object Detection
 
@@ -70,7 +70,7 @@
 - 폴더 이미지에 히트맵을 겹쳐 보고 임계값 슬라이더로 불량 판정 목록 만들기
 - ONNX로 내보내기
 
-![PatchCore 추론](docs/patchcore.png)
+<img src="docs/patchcore.png" alt="PatchCore 추론" width="860">
 
 Sample images: MVTec AD 2 (Vial), Heckler-Kram et al., IJCV 2026.
 Licensed under CC BY-NC-SA 4.0. Heatmap overlays added.
