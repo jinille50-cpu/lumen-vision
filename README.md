@@ -36,7 +36,7 @@
 - 찾은 객체를 스펙트럼 특징으로 K개 그룹으로 분류. 방법(KMeans 등)과 객체, 픽셀, ROI 단위를 고를 수 있음
 - 결과를 CSV, 라벨 맵(npy), 오버레이 PNG로 저장
 
-<img src="docs/hsi_viewer.png" alt="HSI Viewer" width="498">
+<img src="docs/hsi_viewer.png" alt="HSI Viewer" width="860">
 
 ### Segmentation
 
