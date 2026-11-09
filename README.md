@@ -2,6 +2,14 @@
 
 ![Lumen app](docs/home.png)
 
+| 앱 | 하는 일 | 입력 | 결과 |
+| --- | --- | --- | --- |
+| Labeler | 학습용 라벨 만들기 | 이미지, 초분광 큐브 | 박스 라벨(YOLO 형식), 마스크 PNG |
+| HSI Viewer | 초분광 큐브 확인, 스펙트럼 비교 | 초분광 큐브 | 스펙트럼 CSV, 분류 맵 |
+| Segmentation | 분할 모델 학습에서 경량화까지 | 이미지와 라벨 폴더 | 학습 모델, 경량화 모델(ONNX), 평가 그림 |
+| Object Detection | 객체 검출 모델 학습과 내보내기 | 이미지와 박스 라벨 | PyTorch, ONNX 모델 |
+| PatchCore | 정상 이미지만으로 불량 찾기 | 정상 이미지 폴더 | 히트맵, 불량 판정 목록 |
+
 라벨링, 학습, 평가, 추론까지 한 창에서 이어서 하는 비전 도구 모음입니다. Python 3.10 기준입니다.
 
 ## 앱 소개
@@ -44,7 +52,7 @@
 
 ### Object Detection
 
-라벨링한 데이터로 객체 인식 모델을 학습하고 평가해 모델 파일로 내보내는 앱.
+라벨링한 데이터로 객체 검출 모델을 학습하고 평가해 모델 파일로 내보내는 앱.
 
 - YOLOv8, YOLOv10, YOLO11, YOLO12, YOLO26, RT-DETR 중 모델과 크기를 골라 학습
 - 폴더 분리, 비율 분리, K-fold, Full Data 학습을 지원하고, K-fold 평균 best epoch로 전체 데이터 학습 가능
@@ -67,13 +75,48 @@
 Sample images: MVTec AD 2 (Vial), Heckler-Kram et al., IJCV 2026.
 Licensed under CC BY-NC-SA 4.0. Heatmap overlays added.
 
-## 설치 순서
+## 설치와 실행
 
-1. GPU에 맞는 torch, torchvision을 먼저 설치한다 (https://pytorch.org/get-started/locally/).
+1. Python 3.10을 준비한다.
+2. GPU에 맞는 torch, torchvision을 먼저 설치한다 (https://pytorch.org/get-started/locally/).
    - RTX 50 시리즈: cu128 — `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128`
    - 그 외 NVIDIA GPU: 드라이버에 맞는 빌드(예: cu126)
    - GPU 없이 CPU만: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`
-2. CPU판 onnxruntime이 깔려 있으면 먼저 지우기: `pip uninstall onnxruntime`
-3. `pip install -r requirements.txt`
+3. CPU판 onnxruntime이 깔려 있으면 먼저 지운다: `pip uninstall onnxruntime`
+4. 나머지 패키지를 설치한다: `pip install -r requirements.txt`
+5. 실행한다: `python main.py` (홈 화면에서 앱을 고른다)
 
 연구실 PC에서 돌아가는 정확한 버전은 `requirements-lock.txt`에 기록돼 있다 (참고용).
+
+선택 사항: Labeler의 VLM 프롬프트 추천은 [Ollama](https://ollama.com)가 켜져 있어야 한다. 기본 모델은 `gemma4:12b`이고, 서버 주소(`http://localhost:11434`)와 모델 이름은 설정값으로 바꿀 수 있다.
+
+## 모델 가중치와 라이선스
+
+가중치 파일은 저장소에 들어 있지 않다. 각 모델은 만든 곳의 라이선스를 따르므로, 받기 전에 약관을 확인한다.
+
+- SAM 3 (Labeler, HSI Viewer): Meta의 Hugging Face 페이지 https://huggingface.co/facebook/sam3 에서 접근 권한을 신청하고, 승인되면 `sam3.pt`(약 3.4GB)를 받는다. 앱 위쪽의 "SAM 3 로드"로 파일을 고른다. 라이선스는 SAM License.
+- DINOv3 (Segmentation의 DINOv3-S, DINOv3-B): 처음 학습할 때 timm이 Hugging Face에서 가중치를 자동으로 내려받는다 (https://huggingface.co/timm). 라이선스는 DINOv3 License. 접근 승인이 필요하면 Hugging Face에 로그인해서 받는다.
+- YOLO, RT-DETR: Ultralytics가 처음 쓸 때 사전학습 가중치를 내려받는다. Ultralytics 코드는 AGPL-3.0이다.
+- 그 밖의 사전학습 가중치(ImageNet 백본 등)와 VLM 모델도 각각의 라이선스를 따른다.
+
+## 폴더 구조
+
+```
+main.py               홈 화면과 앱 실행
+assets/               앱에 쓰는 그림
+common/               공통 코드 (테마, 설정, 프로젝트 저장, false color)
+docs/                 README 이미지
+tools/
+  labeler/            Labeler
+  hsi_viewer/         HSI Viewer
+  segmentation/       Segmentation
+  yolo/               Object Detection (폴더 이름은 yolo)
+  patchcore/          PatchCore
+requirements.txt      설치할 패키지
+requirements-lock.txt 연구실 PC의 정확한 버전 (참고용)
+LICENSE               MIT
+```
+
+## 라이선스
+
+이 저장소의 코드는 MIT 라이선스입니다 (`LICENSE`). 사용하는 라이브러리와 모델 가중치는 각각의 라이선스를 따릅니다. README의 MVTec AD 2 샘플 이미지는 CC BY-NC-SA 4.0이라 상업적으로 쓸 수 없습니다.
