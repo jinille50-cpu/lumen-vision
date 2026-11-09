@@ -172,7 +172,7 @@ class HomePage(QWidget):
         bar.setObjectName("Title")
         top = QHBoxLayout(bar)
         top.addWidget(QLabel("Lumen Vision"))
-        sub = QLabel("라벨링부터 검사까지")
+        sub = QLabel("통합 Vision app")
         sub.setObjectName("TitleSub")
         top.addWidget(sub)
         top.addStretch(1)
