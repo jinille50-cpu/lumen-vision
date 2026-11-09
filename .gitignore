@@ -1,0 +1,54 @@
+# 모델 가중치
+*.pt
+*.pth
+*.ckpt
+*.onnx
+models/weights/
+
+# 데이터 파일
+*.mat
+*.npy
+*.npz
+*.hdr
+*.raw
+*.tif
+*.tiff
+
+# 파이썬 캐시, 가상환경
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 원래 앱의 git 기록
+_원본_git/
+
+# 무인 실행 로그
+claude_b001.log
+claude_*.log
+checkpoint.png
+b0*.log
+
+# 로그
+*.log
+
+# 완료 표시
+*.done
+
+# 야간 보고
+아침보고.md
+
+# Ultralytics 기본 결과 폴더 (도구는 체크포인트 폴더에 저장하지만 혹시 생기면)
+runs/
+
+# 앱 사용 중 생기는 결과 (추론 결과, 프로젝트 저장)
+infer_results/
+project.json
+
+# 개발 메모 (저장소에는 올리지 않음)
+BACKLOG.md
+INBOX.md
+PROGRESS.md
+CLAUDE.md
+NIGHT_REPORT.md
+*_CLAUDE.md

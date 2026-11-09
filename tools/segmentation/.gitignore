@@ -1,0 +1,35 @@
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 모델·변환 파일
+*.pth
+*.pt
+*.onnx
+*.engine
+trt_cache/
+
+# 실험 기록
+wandb/
+mlruns/
+
+# 학습 결과·로그 폴더
+checkpoints/
+infer_results/
+runs/
+logs/
+results/
+outputs/
+
+# 데이터
+data/
+dataset/
+datasets/
+*.npy
+*.mat
+*.tif
+*.tiff
+
+# 양자화 비교 CSV
+*_quant_compare.csv
+*_sensitivity.csv

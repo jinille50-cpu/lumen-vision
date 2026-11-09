@@ -1,0 +1,31 @@
+# 연구실 PC(Python 3.10)에서 돌아가는 정확한 버전 (참고용 기록)
+# pillow는 이 PC에 13.0.0이 보이나 Python 3.10에서 설치 불가라 12.2.0으로 기록
+# onnxruntime은 이 PC에 CPU판이 설치돼 있어 그대로 기록. 새 환경은 requirements.txt의 onnxruntime-gpu 사용
+
+torch==2.7.1+cu126
+torchvision==0.22.1+cu126
+PySide6==6.11.2
+pyqtgraph==0.14.0
+numpy==2.2.6
+scipy==1.14.0
+scikit-learn==1.5.0
+matplotlib==3.9.0
+pillow==12.2.0
+opencv-python==4.11.0.86
+PyYAML==6.0.2
+tifffile==2025.3.30
+h5py==3.11.0
+spectral==0.24
+segmentation-models-pytorch==0.5.0
+timm==1.0.20
+transformers==5.3.0
+albumentations==2.0.8
+ultralytics==8.4.177
+wandb==0.31.0
+onnx==1.21.0
+onnxruntime==1.23.2
+anomalib==2.7.0
+lightning==2.6.6
+kornia==0.8.2
+FrEIA==0.2
+einops==0.8.2
