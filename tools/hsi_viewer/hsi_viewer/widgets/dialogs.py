@@ -322,7 +322,8 @@ class AslsDialog(QtWidgets.QDialog):
         self.crop = _CropRows(lay, values, shape)
         H, W = shape[:2]
         lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 계산 장치: {device}\n"
-                           "결과 = 원 신호 − 베이스라인. 크롭 범위만 처리해 지금 큐브의 같은 자리에 넣습니다 (원본 파일은 그대로)"))
+                           "결과 = 원 신호 − 베이스라인. 늘 원본 큐브에서 다시 계산합니다 (쌓이지 않음).\n"
+                           "크롭 범위는 미분과 같이 씁니다. 'AsLS 활성화'를 끄면 원본으로 돌아갑니다"))
         _ok_cancel(self, lay)
 
     def values(self) -> dict:
@@ -360,7 +361,8 @@ class DerivDialog(QtWidgets.QDialog):
         self.msg = hint("")
         lay.addWidget(self.msg)
         lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 밴드 {shape[2]}개, 계산 장치: {device}\n"
-                           "x 간격 = 밴드 1칸. 지금 큐브(AsLS 처리했으면 그 결과)에 적용합니다 (원본 파일은 그대로)"))
+                           "x 간격 = 밴드 1칸. 원본 큐브에서 다시 계산합니다 (AsLS가 켜져 있으면 AsLS 다음에 적용).\n"
+                           "크롭 범위는 AsLS와 같이 씁니다. 미분을 '끔'으로 하면 돌아갑니다"))
         self.ok = _ok_cancel(self, lay)
         for w in (self.window, self.poly):
             w.valueChanged.connect(self._validate)
