@@ -16,7 +16,7 @@ from .clustering import (ClusterResult, classify_pixels_by_roi, cluster_pieces, 
 from .io_utils import FILE_FILTER, SUPPORTED_EXTS, Cube, load_cube
 from .processing import CompositeCache, binned_spectrum, false_color, pca_composite, rect_spectrum, snv
 from .sam_engine import SamEngine, SegmentationResult
-from .widgets.dialogs import RoiClassDialog
+from .widgets.dialogs import AslsDialog, DerivDialog, RoiClassDialog
 from .widgets.image_view import ImageCanvas
 from .widgets.panels import SamPanel, ViewPanel
 from .widgets.plot_area import PlotArea
@@ -40,6 +40,39 @@ class _LoadTask(QtCore.QRunnable):
     def run(self):
         try:
             self.signals.done.emit(load_cube(self.path))
+        except Exception as e:  # noqa: BLE001
+            self.signals.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
+class _ProcSignals(QtCore.QObject):
+    progress = QtCore.Signal(int, int)
+    done = QtCore.Signal(object, str)
+    failed = QtCore.Signal(str)
+
+
+class _ProcTask(QtCore.QRunnable):
+    """AsLS / 미분 처리를 백그라운드에서 실행 (B-097, B-099). torch는 여기서 처음 불러온다.
+    kind: "asls" 또는 "deriv"."""
+
+    def __init__(self, kind: str, data: np.ndarray, params: dict):
+        super().__init__()
+        self.kind, self.data, self.params = kind, data, params
+        self.signals = _ProcSignals()
+
+    def run(self):
+        try:
+            p = self.params
+            if self.kind == "asls":
+                from .baseline import asls_cube
+
+                out, dev = asls_cube(self.data, 10.0 ** p["lam_exp"], 10.0 ** (-p["p_exp"]), p["n_iter"],
+                                     progress=self.signals.progress.emit)
+            else:
+                from .derivative import derivative_cube
+
+                out, dev = derivative_cube(self.data, p["order"], p["window"], p["poly"],
+                                           progress=self.signals.progress.emit)
+            self.signals.done.emit(out, dev)
         except Exception as e:  # noqa: BLE001
             self.signals.failed.emit(f"{e}\n{traceback.format_exc()}")
 
@@ -69,6 +102,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_direct = False   # 점·박스 지정 결과를 기다리는 중
         self._load_task = None
         self.pool = QtCore.QThreadPool.globalInstance()
+        # AsLS / 미분 전용: 작업마다 새 스레드 (expiry 0). 같은 풀 스레드를 다시 써서 torch CUDA를
+        # 두 번째로 돌리면 프로그램이 죽는 문제가 있어서 (B-099에서 확인)
+        self.proc_pool = QtCore.QThreadPool(self)
+        self.proc_pool.setExpiryTimeout(0)
 
         self._build_ui()
         self._build_toolbar()
@@ -178,6 +215,19 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addAction(act)
         act = QtGui.QAction("화면 캡처", self)
         act.triggered.connect(self.export_screenshot)
+        tb.addAction(act)
+        tb.addSeparator()
+        act = QtGui.QAction("AsLS 처리…", self)
+        act.setToolTip("모든 픽셀에서 AsLS 베이스라인 제거 (CUDA 있으면 GPU)")
+        act.triggered.connect(self.run_asls)
+        tb.addAction(act)
+        act = QtGui.QAction("미분…", self)
+        act.setToolTip("모든 픽셀 스펙트럼에 Savitzky-Golay 1차/2차 미분 (CUDA 있으면 GPU). AsLS 뒤에 이어서 적용 가능")
+        act.triggered.connect(self.run_deriv)
+        tb.addAction(act)
+        act = QtGui.QAction("큐브 저장…", self)
+        act.setToolTip("지금 큐브(처리 결과 포함)를 MAT 또는 NPY로 저장")
+        act.triggered.connect(self.save_cube)
         tb.addAction(act)
 
         spacer = QtWidgets.QWidget()
@@ -351,8 +401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_axis()
         self.spectrum.set_cursors_visible(self.view_panel.state()["mode"] == 0)
         h, w, b = cube.shape
-        self.file_label.setText(cube.name)
-        self.file_label.setToolTip(cube.path)
+        self._update_file_label()
         self.lbl_shape.setText(f"{w} × {h} px · {b} 밴드 · {cube.data.nbytes / 1e6:.0f} MB")
         self.setWindowTitle(f"{cube.name} — HSI Viewer")
         self._push_recent(cube.path)
@@ -993,6 +1042,185 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sam_panel.set_status(f"객체 {len(pieces)}개")
             self._render_overlay()
         self.sam_panel.set_has_result(bool(pieces))
+
+    # ------------------------------------------------------------------ AsLS / 미분 처리, 큐브 저장 (B-097~B-099)
+    def _crop_settings(self) -> dict:
+        """크롭 범위와 '크롭만 저장'은 AsLS와 미분이 같이 쓴다 (설정 proc/*)"""
+        st = self.settings
+        return {"crop_x": int(st.value("proc/crop_x", 0)), "crop_y": int(st.value("proc/crop_y", 0)),
+                "crop_w": int(st.value("proc/crop_w", 0)), "crop_h": int(st.value("proc/crop_h", 0)),
+                "save_crop": st.value("proc/save_crop", True, type=bool)}
+
+    def _store_settings(self, prefix: str, vals: dict):
+        for k, v in vals.items():
+            group = "proc" if k.startswith(("crop_", "save_crop")) else prefix   # 크롭 값은 공통 그룹
+            self.settings.setValue(f"{group}/{k}", v)
+
+    def run_asls(self):
+        if self.cube is None:
+            return
+        from .baseline import cuda_available
+
+        st = self.settings
+        vals = {"lam_exp": float(st.value("asls/lam_exp", 5.0)), "p_exp": float(st.value("asls/p_exp", 3.0)),
+                "n_iter": int(st.value("asls/n_iter", 10)), **self._crop_settings()}   # **: dict 합치기
+        dlg = AslsDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self.cube.shape)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        vals = dlg.values()
+        self._store_settings("asls", vals)
+        tag = f"AsLS λ=1e{vals['lam_exp']:g} p=1e-{vals['p_exp']:g} n={vals['n_iter']}"
+        self._start_proc("asls", vals, tag, "AsLS")
+
+    def run_deriv(self):
+        if self.cube is None:
+            return
+        from .baseline import cuda_available
+
+        st = self.settings
+        vals = {"order": int(st.value("deriv/order", 1)), "window": int(st.value("deriv/window", 11)),
+                "poly": int(st.value("deriv/poly", 3)), **self._crop_settings()}
+        dlg = DerivDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self.cube.shape)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        vals = dlg.values()
+        self._store_settings("deriv", vals)
+        tag = f"SG {vals['order']}차 미분 w={vals['window']} p={vals['poly']}"
+        self._start_proc("deriv", vals, tag, f"D{vals['order']}")
+
+    @staticmethod
+    def _crop_box(vals: dict, shape: tuple) -> tuple[int, int, int, int]:
+        """대화상자 크롭 값 → (y0, y1, x0, x1). 너비/높이 0이면 큐브 끝까지 (B-098)"""
+        H, W = shape[:2]
+        x0, y0 = min(vals["crop_x"], W - 1), min(vals["crop_y"], H - 1)
+        x1 = W if vals["crop_w"] <= 0 else min(W, x0 + vals["crop_w"])
+        y1 = H if vals["crop_h"] <= 0 else min(H, y0 + vals["crop_h"])
+        return y0, y1, x0, x1
+
+    def _start_proc(self, kind: str, vals: dict, tag: str, short: str):
+        """kind: "asls" / "deriv". tag: 처리 내역 글자, short: 저장 파일 이름 꼬리(AsLS, D1, D2)"""
+        self._proc_tag, self._proc_short = tag, short
+        self._proc_box = self._crop_box(vals, self.cube.shape)
+        y0, y1, x0, x1 = self._proc_box
+        name = "AsLS" if kind == "asls" else "미분"
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
+        self.setEnabled(False)
+        self.statusBar().showMessage(f"{name} 처리 중…")
+        task = _ProcTask(kind, self.cube.data[y0:y1, x0:x1], vals)   # 크롭 범위만 처리
+        task.signals.progress.connect(lambda d, n: self.statusBar().showMessage(f"{name} 처리 중… {d} / {n} 픽셀"))
+        task.signals.done.connect(self._on_proc_done)
+        task.signals.failed.connect(self._on_proc_failed)
+        self._proc_task = task
+        self.proc_pool.start(task)
+
+    def _on_proc_failed(self, msg: str):
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.setEnabled(True)
+        self.statusBar().clearMessage()
+        self._error(f"처리 실패:\n{msg}")
+
+    def _on_proc_done(self, out: np.ndarray, device: str):
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.setEnabled(True)
+        tag = self._proc_tag
+        meta = self.cube.meta
+        y0, y1, x0, x1 = self._proc_box
+        H, W = self.cube.shape[:2]
+        if (y0, y1, x0, x1) == (0, H, 0, W):
+            meta.pop("crop", None)   # 전체를 처리했으면 저장할 범위도 전체
+        else:
+            tag += f" 크롭 x={x0} y={y0} {x1 - x0}×{y1 - y0}"
+            full_done = bool(meta.get("processing")) and "crop" not in meta   # 앞서 전체를 처리한 적 있음
+            out_full = self.cube.data.astype(np.float32)   # 크롭 밖은 그대로 두고 같은 자리에 결과를 넣는다
+            out_full[y0:y1, x0:x1] = out
+            out = out_full
+            if not full_done:
+                # 처리한 크롭을 모두 감싸는 범위 (y0, y1, x0, x1) — 저장할 때 이 범위만 잘라 쓴다
+                c = meta.get("crop", (y0, y1, x0, x1))
+                meta["crop"] = (min(c[0], y0), max(c[1], y1), min(c[2], x0), max(c[3], x1))
+        self.cube.data = out
+        meta.setdefault("processing", []).append(tag)   # 여러 번 처리하면 차례대로 쌓인다 (AsLS → 미분 등)
+        meta.setdefault("proc_short", []).append(self._proc_short)   # 저장 파일 이름 꼬리용
+        self._pca_cache = None
+        self._last_rgb_key = None
+        self.cache.reset(id(out))
+        self._update_file_label()
+        stale = self._drop_stale_clusters(self._proc_box)
+        self._render_base()
+        self._refresh_entries()
+        if self.seg is not None:
+            self._compute_piece_spectra()
+        self.statusBar().showMessage(f"{tag} 완료 ({device})"
+                                     + (" · 이전 분류 결과를 지웠습니다. [분류]를 다시 누르세요" if stale else ""), 10000)
+
+    def _update_file_label(self):
+        """도구 모음 오른쪽 파일 이름 칸. 짧게 보여주고 전체(경로, 처리 내역)는 툴팁으로 (B-102)"""
+        cube = self.cube
+        fm = self.file_label.fontMetrics()
+        name = fm.elidedText(cube.name, QtCore.Qt.ElideMiddle, 220)   # 너무 긴 이름은 가운데를 …로 줄임
+        shorts = cube.meta.get("proc_short", [])
+        tip = cube.path
+        if shorts:
+            # 3단계까지는 모두, 그보다 많으면 처음 → … → 마지막 (단계 수)
+            s = " → ".join(shorts) if len(shorts) <= 3 else f"{shorts[0]} → … → {shorts[-1]} ({len(shorts)}단계)"
+            if "crop" in cube.meta:
+                s += " 크롭"
+            name += f"  ({s})"
+            tip += "\n처리 내역:\n" + "\n".join(f"{i}. {t}" for i, t in enumerate(cube.meta["processing"], 1))
+        self.file_label.setText(name)
+        self.file_label.setToolTip(tip)
+
+    def _drop_stale_clusters(self, box: tuple) -> bool:
+        """처리로 바뀐 픽셀이 분류(클러스터링/ROI)에 쓰인 값이면 그 결과를 지운다 (B-101).
+        분류에 쓰인 값: 객체 픽셀, 배경 보정을 켰으면 배경 픽셀, ROI 분류면 ROI 사각형도 → 이 경우는 늘 낡음.
+        지웠으면 True."""
+        if self.clus is None or self.seg is None:
+            return False
+        y0, y1, x0, x1 = box
+        if not (self.clus.bg_norm or "names" in self.clus.extra or self.seg.label_map[y0:y1, x0:x1].any()):
+            return False   # 처리 범위가 분류에 쓰인 픽셀과 겹치지 않음 → 결과 그대로 유효
+        self.clus = None
+        for q in self.seg.pieces:
+            q.cluster = -1
+        self.cluster_view.clear()
+        self.plots.show_cluster(False)
+        self.sam_panel.set_status(f"객체 {len(self.seg.pieces)}개 · 큐브가 처리되어 이전 분류 결과를 지웠습니다\n"
+                                  "새 값으로 다시 나누려면 [분류]")
+        self._render_overlay()   # '분류별' 색칠이었으면 '객체별'로 돌아간다
+        return True
+
+    def save_cube(self):
+        if self.cube is None:
+            return
+        suffix = "".join("_" + t for t in self.cube.meta.get("proc_short", []))   # 예: _AsLS_D1
+        path = self._save_dialog("큐브 저장", f"{self.cube.stem}{suffix}.mat", "MAT (*.mat);;NumPy (*.npy)")
+        if path:
+            self._write_cube(path)
+
+    def _write_cube(self, path: str):
+        data = self.cube.data
+        crop = self.cube.meta.get("crop")
+        if crop and self.settings.value("proc/save_crop", True, type=bool):
+            data = data[crop[0]:crop[1], crop[2]:crop[3]]   # 처리한 크롭 영역만 저장 (B-098)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
+        try:
+            if path.lower().endswith(".npy"):
+                np.save(path, data)
+            else:
+                import scipy.io as sio
+
+                # load_cube가 다시 읽는 이름: 'image'(H, W, B), 'wavelength'
+                d = {"image": data}
+                if self.cube.has_wavelengths:
+                    d["wavelength"] = np.asarray(self.cube.wavelengths, np.float32)
+                if self.cube.meta.get("processing"):
+                    d["processing"] = " → ".join(self.cube.meta["processing"])
+                sio.savemat(path, d)
+            self.statusBar().showMessage(f"큐브 저장됨 → {path}", 4000)
+        except Exception as e:  # noqa: BLE001
+            self._error(f"큐브 저장 실패:\n{e}")
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
 
     # ------------------------------------------------------------------ 내보내기
     def _save_dialog(self, title: str, default_name: str, filt: str) -> str:

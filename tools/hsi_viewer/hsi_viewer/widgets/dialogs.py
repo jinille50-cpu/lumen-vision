@@ -1,4 +1,4 @@
-"""보조 대화상자: 배치 처리, K 추천, ROI 클래스 지정."""
+"""보조 대화상자: 배치 처리, K 추천, ROI 클래스 지정, AsLS / 미분 설정."""
 from __future__ import annotations
 
 import os
@@ -251,3 +251,128 @@ class RoiClassDialog(QtWidgets.QDialog):
         self.ok.setEnabled(ok)
         self.summary.setText(f"클래스 {len(uniq)}개: {', '.join(uniq)}" if ok
                              else "이름을 모두 채우고, 서로 다른 이름이 2개 이상 있어야 합니다")
+
+
+class _CropRows:
+    """처리 대화상자 공통: 크롭 범위 입력 + '크롭 영역만 저장' 체크 (B-098, B-099).
+    너비/높이 0 = 큐브 끝까지 → 모두 0이면 전체 큐브."""
+
+    def __init__(self, lay: QtWidgets.QVBoxLayout, values: dict, shape: tuple):
+        H, W = shape[:2]
+        self.cx, self.cy, self.cw, self.ch = (QtWidgets.QSpinBox() for _ in range(4))
+        for sb, hi, key in ((self.cx, W - 1, "crop_x"), (self.cy, H - 1, "crop_y"),
+                            (self.cw, W, "crop_w"), (self.ch, H, "crop_h")):
+            sb.setRange(0, hi)
+            sb.setValue(min(int(values[key]), hi))
+        self.cw.setSpecialValueText("끝까지")   # 값이 최솟값(0)일 때 숫자 대신 이 글자를 보여준다
+        self.ch.setSpecialValueText("끝까지")
+        for label, a, b in (("크롭 x, y", self.cx, self.cy), ("너비, 높이", self.cw, self.ch)):
+            box = QtWidgets.QWidget()
+            r = QtWidgets.QHBoxLayout(box)
+            r.setContentsMargins(0, 0, 0, 0)
+            r.addWidget(a)
+            r.addWidget(b)
+            lay.addLayout(form_row(label, box))
+        self.save_crop = QtWidgets.QCheckBox("큐브 저장 시 처리한 크롭 영역만 저장")
+        self.save_crop.setChecked(bool(values["save_crop"]))
+        lay.addWidget(self.save_crop)
+
+    def values(self) -> dict:
+        return {"crop_x": self.cx.value(), "crop_y": self.cy.value(), "crop_w": self.cw.value(),
+                "crop_h": self.ch.value(), "save_crop": self.save_crop.isChecked()}
+
+
+def _ok_cancel(dlg: QtWidgets.QDialog, lay: QtWidgets.QVBoxLayout) -> QtWidgets.QPushButton:
+    btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+    ok = btns.button(QtWidgets.QDialogButtonBox.Ok)
+    ok.setText("처리")
+    btns.button(QtWidgets.QDialogButtonBox.Cancel).setText("취소")
+    btns.accepted.connect(dlg.accept)
+    btns.rejected.connect(dlg.reject)
+    lay.addWidget(btns)
+    return ok
+
+
+class AslsDialog(QtWidgets.QDialog):
+    """AsLS 베이스라인 제거 설정 (B-097, 평활 벌점은 2차 차분 고정 B-099). values: {"lam_exp", "p_exp", "n_iter",
+    "crop_x", "crop_y", "crop_w", "crop_h", "save_crop"}. 크롭 너비/높이 0 = 큐브 끝까지 (B-098)"""
+
+    def __init__(self, parent, values: dict, device: str, shape: tuple):
+        super().__init__(parent)
+        self.setWindowTitle("AsLS 베이스라인 제거")
+        self.setMinimumWidth(380)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        self.lam = QtWidgets.QDoubleSpinBox()
+        self.lam.setRange(0.0, 12.0)
+        self.lam.setDecimals(1)
+        self.lam.setSingleStep(0.5)
+        self.lam.setValue(float(values["lam_exp"]))
+        self.p = QtWidgets.QDoubleSpinBox()
+        self.p.setRange(0.5, 6.0)
+        self.p.setDecimals(1)
+        self.p.setSingleStep(0.5)
+        self.p.setValue(float(values["p_exp"]))
+        self.n_iter = QtWidgets.QSpinBox()
+        self.n_iter.setRange(1, 50)
+        self.n_iter.setValue(int(values["n_iter"]))
+        lay.addLayout(form_row("λ = 10^", self.lam))
+        lay.addLayout(form_row("p = 10^-", self.p))
+        lay.addLayout(form_row("반복", self.n_iter))
+        self.crop = _CropRows(lay, values, shape)
+        H, W = shape[:2]
+        lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 계산 장치: {device}\n"
+                           "결과 = 원 신호 − 베이스라인. 크롭 범위만 처리해 지금 큐브의 같은 자리에 넣습니다 (원본 파일은 그대로)"))
+        _ok_cancel(self, lay)
+
+    def values(self) -> dict:
+        return {"lam_exp": self.lam.value(), "p_exp": self.p.value(), "n_iter": self.n_iter.value(),
+                **self.crop.values()}   # **: 두 dict를 하나로 합친다
+
+
+class DerivDialog(QtWidgets.QDialog):
+    """Savitzky-Golay 1차/2차 미분 설정 (B-099). values: {"order", "window", "poly", 크롭 값들}"""
+
+    def __init__(self, parent, values: dict, device: str, shape: tuple):
+        super().__init__(parent)
+        from ..derivative import check_params
+
+        self._check, self._bands = check_params, shape[2]
+        self.setWindowTitle("미분 (Savitzky-Golay)")
+        self.setMinimumWidth(380)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        self.order = QtWidgets.QComboBox()
+        self.order.addItems(["1차 미분", "2차 미분"])
+        self.order.setCurrentIndex(int(values["order"]) - 1)
+        self.window = QtWidgets.QSpinBox()
+        self.window.setRange(3, 301)
+        self.window.setSingleStep(2)
+        self.window.setValue(int(values["window"]))
+        self.poly = QtWidgets.QSpinBox()
+        self.poly.setRange(1, 10)
+        self.poly.setValue(int(values["poly"]))
+        lay.addLayout(form_row("미분 차수", self.order))
+        lay.addLayout(form_row("윈도우(홀수)", self.window))
+        lay.addLayout(form_row("다항 차수", self.poly))
+        self.crop = _CropRows(lay, values, shape)
+        H, W = shape[:2]
+        self.msg = hint("")
+        lay.addWidget(self.msg)
+        lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 밴드 {shape[2]}개, 계산 장치: {device}\n"
+                           "x 간격 = 밴드 1칸. 지금 큐브(AsLS 처리했으면 그 결과)에 적용합니다 (원본 파일은 그대로)"))
+        self.ok = _ok_cancel(self, lay)
+        for w in (self.window, self.poly):
+            w.valueChanged.connect(self._validate)
+        self.order.currentIndexChanged.connect(self._validate)
+        self._validate()
+
+    def _validate(self, *_):   # *_: 시그널이 넘기는 값은 쓰지 않고 버린다
+        v = self.values()
+        err = self._check(self._bands, v["order"], v["window"], v["poly"])
+        self.msg.setText(err)
+        self.ok.setEnabled(not err)
+
+    def values(self) -> dict:
+        return {"order": self.order.currentIndex() + 1, "window": self.window.value(), "poly": self.poly.value(),
+                **self.crop.values()}
