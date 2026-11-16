@@ -7,6 +7,9 @@ from .. import theme
 from ..clustering import METHODS
 from .common import Card, LabeledSlider, SegmentedControl, form_row, make_button
 
+# 스펙트럼 X축 종류 (번호 0 = 밴드 번호). 글자가 그대로 그래프 축 이름이 된다
+X_KINDS = ["밴드 번호", "Wavelength (nm)", "라만 시프트 (cm⁻¹)"]
+
 
 # =============================================================================
 class ViewPanel(Card):
@@ -18,6 +21,7 @@ class ViewPanel(Card):
     addRoiRequested = QtCore.Signal()
     clearRequested = QtCore.Signal()
     exportRequested = QtCore.Signal()
+    axisChanged = QtCore.Signal()             # 스펙트럼 X축 종류/시작/끝
 
     def __init__(self, parent=None):
         super().__init__("이미지 · 스펙트럼", collapsible=False, parent=parent)
@@ -90,6 +94,34 @@ class ViewPanel(Card):
         row.addWidget(self.chk_snv)
         self.add(row)
 
+        # 스펙트럼 그래프 X축 (B-104): 종류 + 시작/끝 → 밴드 수만큼 균등 간격
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.x_kind = QtWidgets.QComboBox()
+        self.x_kind.addItems(X_KINDS)
+        self.x_kind.setToolTip("스펙트럼 그래프 X축. 밴드 번호 외에는 시작~끝을 밴드 수만큼 같은 간격으로 나눔")
+        row.addLayout(form_row("X축", self.x_kind, 36))
+        self.x_start = QtWidgets.QDoubleSpinBox()
+        self.x_end = QtWidgets.QDoubleSpinBox()
+        for s, tip in ((self.x_start, "첫 밴드의 X 값"), (self.x_end, "마지막 밴드의 X 값 (시작보다 작아도 됨)")):
+            s.setRange(-1e6, 1e6)
+            s.setDecimals(2)
+            s.setKeyboardTracking(False)   # 입력을 마칠 때(엔터/포커스 이동)만 값 변경 알림
+            s.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+            s.setAlignment(QtCore.Qt.AlignRight)
+            s.setFixedWidth(76)
+            s.setToolTip(tip)
+        row.addWidget(self.x_start)
+        dash = QtWidgets.QLabel("~")
+        dash.setObjectName("Muted")
+        row.addWidget(dash)
+        row.addWidget(self.x_end)
+        self.add(row)
+        self.x_kind.currentIndexChanged.connect(self._on_x_kind)
+        self.x_start.valueChanged.connect(lambda _: self._emit_axis())
+        self.x_end.valueChanged.connect(lambda _: self._emit_axis())
+        self._on_x_kind(0)
+
         # 버튼
         row = QtWidgets.QHBoxLayout()
         self.btn_roi = make_button("+ ROI", "", "사각 영역 추가 (영역 평균 스펙트럼). ROI 위에서 오른쪽 클릭 = 삭제")
@@ -128,6 +160,28 @@ class ViewPanel(Card):
             s.setRange(0, max(0, n - 1))
         self.band.setRange(0, max(0, n - 1))
         self._block = False
+
+    def _on_x_kind(self, i: int):
+        for s in (self.x_start, self.x_end):
+            s.setEnabled(i != 0)   # 밴드 번호는 시작/끝을 쓰지 않음
+        self._emit_axis()
+
+    def _emit_axis(self):
+        if not self._block:
+            self.axisChanged.emit()
+
+    def set_x_axis(self, kind: int, start: float, end: float):
+        """새 파일을 열 때 그 파일의 기본값으로 (알림 없이) 맞춘다."""
+        self._block = True
+        self.x_kind.setCurrentIndex(kind)
+        self.x_start.setValue(start)
+        self.x_end.setValue(end)
+        for s in (self.x_start, self.x_end):
+            s.setEnabled(kind != 0)
+        self._block = False
+
+    def x_axis(self) -> tuple[int, float, float]:
+        return self.x_kind.currentIndex(), self.x_start.value(), self.x_end.value()
 
     def set_bands(self, bands):
         self._block = True

@@ -18,7 +18,7 @@ from .processing import CompositeCache, binned_spectrum, false_color, pca_compos
 from .sam_engine import SamEngine, SegmentationResult
 from .widgets.dialogs import AslsDialog, DerivDialog, RoiClassDialog
 from .widgets.image_view import ImageCanvas
-from .widgets.panels import SamPanel, ViewPanel
+from .widgets.panels import X_KINDS, SamPanel, ViewPanel
 from .widgets.plot_area import PlotArea
 
 ORG, APP = "SPILab", "HSIViewer"
@@ -306,6 +306,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v = self.view_panel
         v.changed.connect(self._schedule_render)
         v.spectraChanged.connect(self._refresh_entries)
+        v.axisChanged.connect(self._on_x_axis_changed)
         v.bandChanged.connect(self._on_band_spin)
         v.addRoiRequested.connect(self.add_roi)
         v.clearRequested.connect(self.clear_entries)
@@ -426,6 +427,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clear_segmentation(silent=True)
         self.view_panel.set_n_bands(n)
         self.view_panel.set_bands(self.rgb_bands)
+        self._reset_x_axis()
         self._apply_axis()
         self.spectrum.set_cursors_visible(self.view_panel.state()["mode"] == 0)
         h, w, b = cube.shape
@@ -449,12 +451,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
     # ------------------------------------------------------------------ 축
+    def _reset_x_axis(self):
+        """새 파일: 파장 정보가 있으면 Wavelength + 첫/끝 파장, 없으면 밴드 번호 (B-104)"""
+        n = self.cube.n_bands
+        if self.cube.has_wavelengths:
+            wl = self.cube.wavelengths
+            self.view_panel.set_x_axis(1, float(wl[0]), float(wl[-1]))
+        else:
+            self.view_panel.set_x_axis(0, 0.0, float(n - 1))
+
     def _axis(self) -> tuple[np.ndarray, str]:
         if self.cube is None:
             return np.arange(1, dtype=np.float32), "밴드"
-        if self.cube.has_wavelengths:
-            return self.cube.wavelengths, "파장 (nm)"
-        return np.arange(self.cube.n_bands, dtype=np.float32), "밴드 번호"
+        n = self.cube.n_bands
+        kind, a, b = self.view_panel.x_axis()
+        if kind == 0 or (n > 1 and a == b):   # 시작 = 끝이면 축을 만들 수 없으니 밴드 번호
+            return np.arange(n, dtype=np.float32), X_KINDS[0]
+        if kind == 1 and self.cube.has_wavelengths:
+            wl = self.cube.wavelengths
+            # 시작/끝을 파일 값 그대로 두었으면 파일의 파장 배열을 그대로 쓴다 (간격이 고르지 않아도 정확).
+            # 입력 칸은 소수 둘째 자리까지라 그만큼의 차이는 같은 값으로 본다
+            if abs(a - float(wl[0])) < 0.006 and abs(b - float(wl[-1])) < 0.006:
+                return wl, X_KINDS[1]
+        # 직접 입력: 시작~끝을 밴드 수만큼 같은 간격으로 (시작 > 끝이면 줄어드는 축)
+        return np.linspace(a, b, n, dtype=np.float32), X_KINDS[kind]
+
+    def _on_x_axis_changed(self):
+        kind, a, b = self.view_panel.x_axis()
+        if self.cube is None:
+            return
+        if kind != 0 and self.cube.n_bands > 1 and a == b:
+            self.statusBar().showMessage("X축 시작과 끝이 같습니다. 다른 값을 넣을 때까지 밴드 번호로 표시합니다.", 5000)
+        self._apply_axis()
+        self._refresh_entries()   # 저장된 x로 곡선을 다시 그린다
+
+    def _ylabel(self, use_snv: bool) -> str:
+        """스펙트럼 Y축 이름. 미분이 켜져 있으면 미분 차수를 붙인다 (B-104)"""
+        base = "SNV" if use_snv else "세기 (Intensity)"
+        d = [t for t in self.cube.meta.get("proc_short", []) if t in ("D1", "D2")] if self.cube is not None else []
+        if not d:
+            return base
+        order = d[-1][1]
+        return f"SNV ({order}차 미분)" if use_snv else f"{order}차 미분 (Intensity)"
 
     def _apply_axis(self):
         x, label = self._axis()
@@ -693,7 +731,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                   else f" [{e['cls']}]" if e.get("cls") else " (ROI 평균)")
             traces.append({"label": label, "color": e["color"], "y": spec, "std": sd, "width": 2})
         self.spectrum.set_spectra(traces)
-        self.spectrum.set_ylabel("SNV" if st["snv"] else "세기 (Intensity)")
+        self.spectrum.set_ylabel(self._ylabel(st["snv"]))
         self._update_piece_view()
         self._update_cluster_view()
 
@@ -976,14 +1014,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piece_view.set_pieces(self._piece_disp["snv" if use_snv else "raw"],
                                    [self._piece_color(q)[0] for q in self.seg.pieces],
                                    [q.prompt for q in self.seg.pieces],
-                                   "SNV" if use_snv else "세기 (Intensity)", self.selected_piece or None)
+                                   self._ylabel(use_snv), self.selected_piece or None)
 
     def _update_cluster_view(self):
         """클러스터 그래프를 포인트 그래프와 같은 공간(세기 / SNV)으로 그린다."""
         if self.clus is None:
             return
         use_snv = self.view_panel.state()["snv"]
-        self.cluster_view.set_result(self.clus, self._class_colors(), "SNV" if use_snv else "세기 (Intensity)",
+        self.cluster_view.set_result(self.clus, self._class_colors(), self._ylabel(use_snv),
                                      self.selected_piece or None, space="snv" if use_snv else "raw")
 
     def select_piece(self, pid: int):
