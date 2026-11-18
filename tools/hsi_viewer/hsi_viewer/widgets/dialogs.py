@@ -253,33 +253,21 @@ class RoiClassDialog(QtWidgets.QDialog):
                              else "이름을 모두 채우고, 서로 다른 이름이 2개 이상 있어야 합니다")
 
 
-class _CropRows:
-    """처리 대화상자 공통: 크롭 범위 입력 + '크롭 영역만 저장' 체크 (B-098, B-099).
-    너비/높이 0 = 큐브 끝까지 → 모두 0이면 전체 큐브."""
+class _BandRows:
+    """처리 대화상자 공통: 시작 밴드 + '잘린 큐브 저장' 체크 (B-106, 전에는 공간 크롭 B-098).
+    처리는 시작 밴드부터 마지막 밴드까지만 하고 앞 밴드는 잘라낸다."""
 
-    def __init__(self, lay: QtWidgets.QVBoxLayout, values: dict, shape: tuple):
-        H, W = shape[:2]
-        self.cx, self.cy, self.cw, self.ch = (QtWidgets.QSpinBox() for _ in range(4))
-        for sb, hi, key in ((self.cx, W - 1, "crop_x"), (self.cy, H - 1, "crop_y"),
-                            (self.cw, W, "crop_w"), (self.ch, H, "crop_h")):
-            sb.setRange(0, hi)
-            sb.setValue(min(int(values[key]), hi))
-        self.cw.setSpecialValueText("끝까지")   # 값이 최솟값(0)일 때 숫자 대신 이 글자를 보여준다
-        self.ch.setSpecialValueText("끝까지")
-        for label, a, b in (("크롭 x, y", self.cx, self.cy), ("너비, 높이", self.cw, self.ch)):
-            box = QtWidgets.QWidget()
-            r = QtWidgets.QHBoxLayout(box)
-            r.setContentsMargins(0, 0, 0, 0)
-            r.addWidget(a)
-            r.addWidget(b)
-            lay.addLayout(form_row(label, box))
-        self.save_crop = QtWidgets.QCheckBox("큐브 저장 시 처리한 크롭 영역만 저장")
-        self.save_crop.setChecked(bool(values["save_crop"]))
-        lay.addWidget(self.save_crop)
+    def __init__(self, lay: QtWidgets.QVBoxLayout, values: dict):
+        self.start = QtWidgets.QSpinBox()
+        self.start.setRange(0, 100000)   # 밴드 수 이상이면 대화상자/처리에서 오류로 알려 준다
+        self.start.setValue(int(values["band_start"]))
+        lay.addLayout(form_row("시작 밴드", self.start))
+        self.save_cut = QtWidgets.QCheckBox("잘린 큐브 저장 (끄면 앞 밴드를 원본 값으로 붙여 저장)")
+        self.save_cut.setChecked(bool(values["save_cut"]))
+        lay.addWidget(self.save_cut)
 
     def values(self) -> dict:
-        return {"crop_x": self.cx.value(), "crop_y": self.cy.value(), "crop_w": self.cw.value(),
-                "crop_h": self.ch.value(), "save_crop": self.save_crop.isChecked()}
+        return {"band_start": self.start.value(), "save_cut": self.save_cut.isChecked()}
 
 
 def _ok_cancel(dlg: QtWidgets.QDialog, lay: QtWidgets.QVBoxLayout) -> QtWidgets.QPushButton:
@@ -294,8 +282,8 @@ def _ok_cancel(dlg: QtWidgets.QDialog, lay: QtWidgets.QVBoxLayout) -> QtWidgets.
 
 
 class AslsDialog(QtWidgets.QDialog):
-    """AsLS 베이스라인 제거 설정 (B-097, 평활 벌점은 2차 차분 고정 B-099). values: {"lam_exp", "p_exp", "n_iter",
-    "crop_x", "crop_y", "crop_w", "crop_h", "save_crop"}. 크롭 너비/높이 0 = 큐브 끝까지 (B-098)"""
+    """AsLS 베이스라인 제거 설정 (B-097, 평활 벌점은 2차 차분 고정 B-099, 반복 5 고정 B-106).
+    values: {"lam_exp", "p_exp", "band_start", "save_cut"}"""
 
     def __init__(self, parent, values: dict, device: str, shape: tuple):
         super().__init__(parent)
@@ -313,26 +301,34 @@ class AslsDialog(QtWidgets.QDialog):
         self.p.setDecimals(1)
         self.p.setSingleStep(0.5)
         self.p.setValue(float(values["p_exp"]))
-        self.n_iter = QtWidgets.QSpinBox()
-        self.n_iter.setRange(1, 50)
-        self.n_iter.setValue(int(values["n_iter"]))
         lay.addLayout(form_row("λ = 10^", self.lam))
         lay.addLayout(form_row("p = 10^-", self.p))
-        lay.addLayout(form_row("반복", self.n_iter))
-        self.crop = _CropRows(lay, values, shape)
+        self.bands = _BandRows(lay, values)
         H, W = shape[:2]
-        lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 계산 장치: {device}\n"
+        self._n = shape[2]
+        self.msg = hint("")
+        lay.addWidget(self.msg)
+        lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 밴드 {shape[2]}개, 계산 장치: {device}, 반복 5회\n"
                            "결과 = 원 신호 − 베이스라인. 늘 원본 큐브에서 다시 계산합니다 (쌓이지 않음).\n"
-                           "크롭 범위는 미분과 같이 씁니다. 'AsLS 활성화'를 끄면 원본으로 돌아갑니다"))
-        _ok_cancel(self, lay)
+                           "시작 밴드는 배경 빼기, 미분과 같이 씁니다. 'AsLS 활성화'를 끄면 원본으로 돌아갑니다"))
+        self.ok = _ok_cancel(self, lay)
+        self.bands.start.valueChanged.connect(self._validate)
+        self._validate()
+
+    def _validate(self, *_):
+        left = self._n - self.bands.start.value()   # 잘라낸 뒤 남는 밴드 수
+        err = (f"시작 밴드가 밴드 수({self._n}) 이상입니다" if left <= 0
+               else f"남는 밴드({left}개)가 너무 적습니다 (4개 이상)" if left <= 3 else "")
+        self.msg.setText(err)
+        self.ok.setEnabled(not err)
 
     def values(self) -> dict:
-        return {"lam_exp": self.lam.value(), "p_exp": self.p.value(), "n_iter": self.n_iter.value(),
-                **self.crop.values()}   # **: 두 dict를 하나로 합친다
+        return {"lam_exp": self.lam.value(), "p_exp": self.p.value(),
+                **self.bands.values()}   # **: 두 dict를 하나로 합친다
 
 
 class DerivDialog(QtWidgets.QDialog):
-    """Savitzky-Golay 1차/2차 미분 설정 (B-099). values: {"order", "window", "poly", 크롭 값들}"""
+    """Savitzky-Golay 1차/2차 미분 설정 (B-099). values: {"order", "window", "poly", 시작 밴드 값들}"""
 
     def __init__(self, parent, values: dict, device: str, shape: tuple):
         super().__init__(parent)
@@ -356,25 +352,27 @@ class DerivDialog(QtWidgets.QDialog):
         lay.addLayout(form_row("미분 차수", self.order))
         lay.addLayout(form_row("윈도우(홀수)", self.window))
         lay.addLayout(form_row("다항 차수", self.poly))
-        self.crop = _CropRows(lay, values, shape)
+        self.bands = _BandRows(lay, values)
         H, W = shape[:2]
         self.msg = hint("")
         lay.addWidget(self.msg)
         lay.addWidget(hint(f"큐브 {W}×{H} 픽셀, 밴드 {shape[2]}개, 계산 장치: {device}\n"
                            "x 간격 = 밴드 1칸. 원본 큐브에서 다시 계산합니다 (AsLS가 켜져 있으면 AsLS 다음에 적용).\n"
-                           "크롭 범위는 AsLS와 같이 씁니다. 미분을 '끔'으로 하면 돌아갑니다"))
+                           "시작 밴드는 배경 빼기, AsLS와 같이 씁니다. 미분을 '끔'으로 하면 돌아갑니다"))
         self.ok = _ok_cancel(self, lay)
-        for w in (self.window, self.poly):
+        for w in (self.window, self.poly, self.bands.start):
             w.valueChanged.connect(self._validate)
         self.order.currentIndexChanged.connect(self._validate)
         self._validate()
 
     def _validate(self, *_):   # *_: 시그널이 넘기는 값은 쓰지 않고 버린다
         v = self.values()
-        err = self._check(self._bands, v["order"], v["window"], v["poly"])
+        b0 = v["band_start"]
+        err = (f"시작 밴드({b0})가 밴드 수({self._bands}) 이상입니다" if b0 >= self._bands
+               else self._check(self._bands - b0, v["order"], v["window"], v["poly"]))   # 잘린 밴드 수로 검사
         self.msg.setText(err)
         self.ok.setEnabled(not err)
 
     def values(self) -> dict:
         return {"order": self.order.currentIndex() + 1, "window": self.window.value(), "poly": self.poly.value(),
-                **self.crop.values()}
+                **self.bands.values()}

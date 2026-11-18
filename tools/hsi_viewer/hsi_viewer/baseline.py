@@ -5,7 +5,7 @@
 픽셀 방향은 배열 한 줄 연산으로 동시에 계산한다(벡터화). 같은 코드를
 numpy(CPU)와 torch(GPU)에 그대로 쓴다: 두 모듈 모두 sqrt, where, empty_like 이름이 같다.
 
-run_blocks 는 AsLS와 미분(derivative.py)이 같이 쓰는 "픽셀 블록 단위 CPU/GPU 실행기".
+run_blocks 는 AsLS, 미분(derivative.py), 배경 배율 맞춤(B-106)이 같이 쓰는 "픽셀 블록 단위 CPU/GPU 실행기".
 """
 from __future__ import annotations
 
@@ -82,10 +82,12 @@ def cuda_available() -> bool:
 
 
 def run_blocks(data: np.ndarray, make_fn, device: str = "auto", progress=None,
-               gpu_elems: int = 16_000_000, cpu_elems: int = 4_000_000) -> tuple[np.ndarray, str]:
-    """(H, W, B) 큐브를 픽셀 블록으로 나눠 fn 을 적용하고 (H, W, B) float32 로 돌려준다.
+               gpu_elems: int = 16_000_000, cpu_elems: int = 4_000_000,
+               out_bands: int | None = None) -> tuple[np.ndarray, str]:
+    """(H, W, B) 큐브를 픽셀 블록으로 나눠 fn 을 적용하고 (H, W, out_bands) float32 로 돌려준다.
 
-    make_fn(xp, dev) → fn(Y): Y 는 (B, 픽셀) float64 배열(xp = numpy 또는 torch, dev 장치), 같은 모양을 돌려준다.
+    make_fn(xp, dev) → fn(Y): Y 는 (B, 픽셀) float64 배열(xp = numpy 또는 torch, dev 장치),
+    (out_bands, 픽셀) 을 돌려준다. out_bands 를 안 주면 B (입력과 같은 모양).
     device: "auto"(CUDA 있으면 GPU), "cpu", "cuda". 블록 크기 = 원소 수 gpu_elems / cpu_elems 기준.
     progress(done, total): 블록 하나 끝날 때마다 호출. 반환: (결과, 실제 쓴 장치 이름)
 
@@ -97,7 +99,7 @@ def run_blocks(data: np.ndarray, make_fn, device: str = "auto", progress=None,
         device = "cuda" if cuda_available() else "cpu"
     flat = data.reshape(-1, B)
     n = flat.shape[0]
-    out = np.empty((n, B), np.float32)
+    out = np.empty((n, out_bands or B), np.float32)
     s = 0            # 다음에 계산할 픽셀 위치
     name = "CPU"
     if device == "cuda":
@@ -143,10 +145,10 @@ def run_blocks(data: np.ndarray, make_fn, device: str = "auto", progress=None,
             s = min(s + step, n)
             if progress:
                 progress(s, n)
-    return out.reshape(h_, w_, B), name
+    return out.reshape(h_, w_, out.shape[1]), name
 
 
-def asls_cube(data: np.ndarray, lam: float = 1e5, p: float = 1e-3, n_iter: int = 10,
+def asls_cube(data: np.ndarray, lam: float = 1e5, p: float = 1e-3, n_iter: int = 5,
               device: str = "auto", progress=None) -> tuple[np.ndarray, str]:
     """(H, W, B) 큐브의 모든 픽셀에서 AsLS 베이스라인(2차 차분 평활 벌점)을 빼서 (H, W, B) float32로 돌려준다.
 
@@ -165,3 +167,43 @@ def asls_cube(data: np.ndarray, lam: float = 1e5, p: float = 1e-3, n_iter: int =
         return lambda Y: Y - _asls_block(xp, Y, d0, h, p, n_iter)
 
     return run_blocks(data, make_fn, device, progress)
+
+
+def _k_block(xp, Y, bg, p, n_iter):
+    """Y: (B, N), bg: (B, 1) 배경 스펙트럼(Y와 같은 장치). 반환: 픽셀별 배율 k (1, N).
+
+    비대칭 가중 최소제곱: k = Σ w·y·bg / Σ w·bg². 신호가 k·bg 보다 위(피크)면 작은 가중치 p,
+    아래면 1-p 로 바꿔 가며 반복 → 피크가 k를 키우지 못하고 k·bg 는 신호 아래쪽에 붙는다.
+    """
+    lo, hi = xp.full_like(Y, p), xp.full_like(Y, 1.0 - p)
+    w = xp.ones_like(Y)
+    bb = bg * bg
+    for _ in range(n_iter):
+        den = (w * bb).sum(0)
+        k = (w * Y * bg).sum(0) / (den + (den == 0))   # 배경이 0뿐이면 분모 1 (분자도 0 → k = 0)
+        k = k * (k > 0)                                  # k ≥ 0 (True=1, False=0 을 곱함)
+        w = xp.where(Y > k * bg, lo, hi)
+    return k[None, :]
+
+
+def bg_scale_cube(data: np.ndarray, bg: np.ndarray, median: bool = False, p: float = 0.01, n_iter: int = 5,
+                  device: str = "auto", progress=None) -> tuple[np.ndarray, str]:
+    """배경 빼기(배율 맞춤, B-106): 픽셀마다 y − k·bg. k 는 _k_block (k ≥ 0).
+
+    data: (H, W, B), bg: (B,). median=True 면 k 맵에 3×3 중앙값 필터 (튀는 k 정리).
+    반환: (결과 (H, W, B) float32, 실제 쓴 장치 이름). 결과 계산은 CPU, k 찾기만 run_blocks.
+    """
+    bg64 = np.asarray(bg, np.float64)[:, None]
+
+    def make_fn(xp, dev):
+        b = bg64 if xp is np else xp.tensor(bg64, device=dev)
+        return lambda Y: _k_block(xp, Y, b, p, n_iter)
+
+    kmap, name = run_blocks(data, make_fn, device, progress, out_bands=1)
+    kmap = kmap[:, :, 0]
+    if median:
+        from scipy.ndimage import median_filter
+
+        kmap = median_filter(kmap, size=3, mode="nearest")
+    # kmap[:, :, None]: (H, W) → (H, W, 1) 로 늘려 (B,) 배경과 곱하면 (H, W, B)
+    return (data - kmap[:, :, None] * np.asarray(bg, np.float32)).astype(np.float32, copy=False), name

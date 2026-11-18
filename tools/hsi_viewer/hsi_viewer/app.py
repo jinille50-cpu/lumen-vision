@@ -51,23 +51,31 @@ class _ProcSignals(QtCore.QObject):
 
 
 class _ProcTask(QtCore.QRunnable):
-    """AsLS / 미분 처리를 백그라운드에서 실행 (B-097, B-099). torch는 여기서 처음 불러온다.
-    steps: [(kind, params), ...] 를 차례로 적용 (kind: "asls" 또는 "deriv"). 원본에서 시작 (B-103)."""
+    """배경 빼기 / AsLS / 미분 처리를 백그라운드에서 실행 (B-097, B-099, B-105). torch는 여기서 처음 불러온다.
+    steps: [(kind, params), ...] 를 차례로 적용 (kind: "bg", "asls", "deriv"). 원본에서 시작 (B-103).
+    data 는 시작 밴드부터 잘린 원본 (B-106). clip=True 면 마지막에 음수를 0으로."""
 
-    def __init__(self, steps: list, data: np.ndarray):
+    def __init__(self, steps: list, data: np.ndarray, clip: bool = False):
         super().__init__()
-        self.steps, self.data = steps, data
+        self.steps, self.data, self.clip = steps, data, clip
         self.signals = _ProcSignals()
 
     def run(self):
         try:
             out, devs = self.data, []
             for kind, p in self.steps:
-                if kind == "asls":
+                if kind == "bg" and not p["scale"]:   # 단일 빼기 (B-105). spec (B,)가 (H, W, B)에 자동으로 맞춰짐
+                    out = out - p["spec"]
+                    continue
+                if kind == "bg":   # 픽셀별 배율 맞춤 y − k·bg (B-106)
+                    from .baseline import bg_scale_cube
+
+                    out, dev = bg_scale_cube(out, p["spec"], p["median"], progress=self.signals.progress.emit)
+                elif kind == "asls":
                     from .baseline import asls_cube
 
-                    out, dev = asls_cube(out, 10.0 ** p["lam_exp"], 10.0 ** (-p["p_exp"]), p["n_iter"],
-                                         progress=self.signals.progress.emit)
+                    out, dev = asls_cube(out, 10.0 ** p["lam_exp"], 10.0 ** (-p["p_exp"]),
+                                         progress=self.signals.progress.emit)   # 반복 5 고정 (B-106)
                 else:
                     from .derivative import derivative_cube
 
@@ -75,7 +83,9 @@ class _ProcTask(QtCore.QRunnable):
                                                progress=self.signals.progress.emit)
                 if dev not in devs:
                     devs.append(dev)
-            self.signals.done.emit(out, " / ".join(devs))
+            if self.clip:   # 처리 결과의 음수를 0으로 (B-106). out 은 단계마다 새로 만든 배열이라 그 자리에서 바꿔도 원본은 그대로
+                np.maximum(out, 0, out=out)
+            self.signals.done.emit(out, " / ".join(devs) or "CPU")
         except Exception as e:  # noqa: BLE001
             self.signals.failed.emit(f"{e}\n{traceback.format_exc()}")
 
@@ -111,8 +121,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.proc_pool.setExpiryTimeout(0)
         # 처리 켜고 끄기 (B-103): 원본 큐브 값은 따로 들고 있고, 처리 결과는 늘 원본에서 새로 계산한다
         self._orig_data: np.ndarray | None = None
-        self._proc_key = ((), None)       # 지금 화면에 적용된 (처리 단계들, 크롭 범위). 처리 없음 = ((), None)
-        self._proc_ui = (False, 0)        # 그때의 (AsLS 체크, 미분 선택) — 실패하면 이 상태로 되돌린다
+        self._orig_wl: np.ndarray | None = None   # 원본 파장 (B-106: 시작 밴드로 자르면 cube.wavelengths 도 잘림)
+        self._proc_key = ((), None)       # 지금 화면에 적용된 (처리 단계들, (시작 밴드, 음수 자르기)). 처리 없음 = ((), None)
+        self._bg: dict | None = None       # 배경 스펙트럼 (B-105): 고른 순간 원본에서 잰 값 {label, x, y, bin, spec}
+        self._proc_ui = (False, 0, None)  # 그때의 (AsLS 체크, 미분 선택, 배경) — 실패하면 이 상태로 되돌린다
         self._proc_busy = self._proc_again = False   # 계산 중 / 계산 중에 선택이 바뀜
 
         self._build_ui()
@@ -225,7 +237,13 @@ class MainWindow(QtWidgets.QMainWindow):
         act.triggered.connect(self.export_screenshot)
         tb.addAction(act)
         tb.addSeparator()
-        # 처리는 켜고 끄는 방식 (B-103): 늘 원본에서 시작해 켜진 것만 AsLS → 미분 순으로 적용
+        # 처리는 켜고 끄는 방식 (B-103): 늘 원본에서 시작해 켜진 것만 배경 빼기 → AsLS → 미분 순으로 적용
+        self.cmb_bg = QtWidgets.QComboBox()
+        self.cmb_bg.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.cmb_bg.setToolTip("고른 포인트의 원본 스펙트럼(binning 설정이면 binning 평균)을 모든 픽셀에서 뺌.\n"
+                               "AsLS / 미분보다 먼저 적용. 고른 순간의 값을 쓰므로 포인트를 옮기면 다시 고르세요")
+        self.cmb_bg.activated.connect(self._on_bg_chosen)   # activated: 사용자가 고를 때만 (목록을 다시 채울 때는 안 불림)
+        tb.addWidget(self.cmb_bg)
         self.chk_asls = QtWidgets.QCheckBox("AsLS 활성화")
         self.chk_asls.setToolTip("켜면 원본 큐브에 AsLS 베이스라인 제거를 적용, 끄면 원본으로 돌아감 (CUDA 있으면 GPU)")
         self.chk_asls.toggled.connect(self._apply_proc)
@@ -238,15 +256,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # 설정 대화상자 두 개는 메뉴 하나로 묶는다 (도구 모음 폭 절약)
         menu = QtWidgets.QMenu(self)
         act = menu.addAction("AsLS 설정…")
-        act.setToolTip("λ, p, 반복, 크롭 범위. '처리'를 누르면 AsLS를 켜고 다시 계산")
+        act.setToolTip("λ, p, 시작 밴드. '처리'를 누르면 AsLS를 켜고 다시 계산")
         act.triggered.connect(self.run_asls)
         act = menu.addAction("미분 설정…")
-        act.setToolTip("윈도우, 다항 차수, 크롭 범위. '처리'를 누르면 미분을 켜고 다시 계산")
+        act.setToolTip("윈도우, 다항 차수, 시작 밴드. '처리'를 누르면 미분을 켜고 다시 계산")
         act.triggered.connect(self.run_deriv)
+        menu.addSeparator()
+        # 켜고 끄는 처리 옵션 (B-106). 설정에 저장되고, 바꾸면 바로 다시 계산
+        self.proc_opts = {}
+        for key, text, default, tip in (
+                ("bg_scale", "배경 배율 맞춤", True,
+                 "픽셀마다 y − k·배경. k는 비대칭 가중 최소제곱(반복 5, 피크는 작은 가중치), k ≥ 0.\n끄면 배경을 그대로 한 번 뺌"),
+                ("bg_median", "k 맵 3×3 중앙값", False, "배율 맞춤에서 구한 k 맵에 3×3 중앙값 필터 (튀는 픽셀 정리)"),
+                ("clip_neg", "음수를 0으로 자르기", False, "켜진 처리를 모두 한 뒤 음수 값을 0으로")):
+            act = menu.addAction(text)
+            act.setCheckable(True)
+            act.setChecked(self.settings.value(f"proc/{key}", default, type=bool))
+            act.setToolTip(tip)
+            # lambda 기본값 k=key: 반복문 변수를 그 순간 값으로 묶어 둔다 (안 하면 마지막 key만 남음)
+            act.toggled.connect(lambda on, k=key: (self.settings.setValue(f"proc/{k}", on), self._apply_proc()))
+            self.proc_opts[key] = act
         menu.setToolTipsVisible(True)
         b = QtWidgets.QToolButton()
         b.setText("설정 ▾")
-        b.setToolTip("AsLS / 미분 설정 (크롭 범위는 둘이 같이 씀)")
+        b.setToolTip("AsLS / 미분 설정 (시작 밴드는 모든 처리가 같이 씀), 배경 배율 맞춤, 음수 자르기")
         b.setMenu(menu)
         b.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         tb.addWidget(b)
@@ -409,8 +442,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setEnabled(True)
         self.cube = cube
         self._orig_data = cube.data   # 원본 보존 (B-103). 처리를 모두 끄면 이 배열을 그대로 다시 쓴다
-        self._proc_key, self._proc_ui = ((), None), (False, 0)
-        self._set_proc_ui(False, 0)   # 새 파일은 처리 꺼진 상태로 시작
+        self._orig_wl = cube.wavelengths
+        self._proc_key, self._proc_ui = ((), None), (False, 0, None)
+        self._set_proc_ui(False, 0, None)   # 새 파일은 처리 꺼진 상태로 시작
         self._pca_cache = None
         self._last_rgb_key = None
         self.cache.reset(id(cube.data))
@@ -463,18 +497,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _axis(self) -> tuple[np.ndarray, str]:
         if self.cube is None:
             return np.arange(1, dtype=np.float32), "밴드"
-        n = self.cube.n_bands
+        # 축은 원본 밴드 전체 기준으로 만들고, 시작 밴드로 잘렸으면 같은 만큼 앞을 잘라낸다 (B-106)
+        n = self._orig_data.shape[2]
+        b0 = self.cube.meta.get("band_start", 0)
         kind, a, b = self.view_panel.x_axis()
-        if kind == 0 or (n > 1 and a == b):   # 시작 = 끝이면 축을 만들 수 없으니 밴드 번호
-            return np.arange(n, dtype=np.float32), X_KINDS[0]
-        if kind == 1 and self.cube.has_wavelengths:
-            wl = self.cube.wavelengths
+        if kind == 0 or (n > 1 and a == b):   # 시작 = 끝이면 축을 만들 수 없으니 밴드 번호 (원본 번호 그대로)
+            return np.arange(n, dtype=np.float32)[b0:], X_KINDS[0]
+        wl = self._orig_wl
+        if kind == 1 and wl is not None and len(wl) == n:
             # 시작/끝을 파일 값 그대로 두었으면 파일의 파장 배열을 그대로 쓴다 (간격이 고르지 않아도 정확).
             # 입력 칸은 소수 둘째 자리까지라 그만큼의 차이는 같은 값으로 본다
             if abs(a - float(wl[0])) < 0.006 and abs(b - float(wl[-1])) < 0.006:
-                return wl, X_KINDS[1]
+                return wl[b0:], X_KINDS[1]
         # 직접 입력: 시작~끝을 밴드 수만큼 같은 간격으로 (시작 > 끝이면 줄어드는 축)
-        return np.linspace(a, b, n, dtype=np.float32), X_KINDS[kind]
+        return np.linspace(a, b, n, dtype=np.float32)[b0:], X_KINDS[kind]
 
     def _on_x_axis_changed(self):
         kind, a, b = self.view_panel.x_axis()
@@ -721,6 +757,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pts = [(e["x"], e["y"], e["label"]) for e in self.entries if e["kind"] == "point"]
         cols = [e["color"] for e in self.entries if e["kind"] == "point"]
         self.canvas.set_points(pts, cols, st["bin"])
+        self._update_bg_combo()
         if self.cube is None:
             self.spectrum.set_spectra([])
             return
@@ -744,7 +781,7 @@ class MainWindow(QtWidgets.QMainWindow):
         st = self.view_panel.state()
         data = self.cube.data
         if st["mode"] == 1:
-            b = int(st["band"])
+            b = int(np.clip(st["band"], 0, data.shape[2] - 1))   # 시작 밴드로 잘려 밴드 수가 줄었을 수 있음 (B-106)
             txt = f"x {x:4d}  y {y:4d}   밴드 {b}: {data[y, x, b]:.4g}"
         else:
             r, g, b = self.rgb_bands
@@ -1109,23 +1146,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._render_overlay()
         self.sam_panel.set_has_result(bool(pieces))
 
-    # ------------------------------------------------------------------ AsLS / 미분 처리, 큐브 저장 (B-097~B-099)
-    def _crop_settings(self) -> dict:
-        """크롭 범위와 '크롭만 저장'은 AsLS와 미분이 같이 쓴다 (설정 proc/*)"""
+    # ------------------------------------------------------------------ 배경 빼기 / AsLS / 미분 처리, 큐브 저장 (B-097~B-106)
+    def _band_settings(self) -> dict:
+        """시작 밴드와 '잘린 큐브 저장'은 모든 처리가 같이 쓴다 (설정 proc/*, B-106)"""
         st = self.settings
-        return {"crop_x": int(st.value("proc/crop_x", 0)), "crop_y": int(st.value("proc/crop_y", 0)),
-                "crop_w": int(st.value("proc/crop_w", 0)), "crop_h": int(st.value("proc/crop_h", 0)),
-                "save_crop": st.value("proc/save_crop", True, type=bool)}
+        return {"band_start": int(st.value("proc/band_start", 100)),
+                "save_cut": st.value("proc/save_cut", True, type=bool)}
 
     def _store_settings(self, prefix: str, vals: dict):
         for k, v in vals.items():
-            group = "proc" if k.startswith(("crop_", "save_crop")) else prefix   # 크롭 값은 공통 그룹
+            group = "proc" if k in ("band_start", "save_cut") else prefix   # 시작 밴드 값은 공통 그룹
             self.settings.setValue(f"{group}/{k}", v)
 
     def _asls_settings(self) -> dict:
         st = self.settings
-        return {"lam_exp": float(st.value("asls/lam_exp", 5.0)), "p_exp": float(st.value("asls/p_exp", 3.0)),
-                "n_iter": int(st.value("asls/n_iter", 10))}
+        return {"lam_exp": float(st.value("asls/lam_exp", 5.0)), "p_exp": float(st.value("asls/p_exp", 3.0))}
 
     def _deriv_settings(self) -> dict:
         st = self.settings
@@ -1138,12 +1173,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from .baseline import cuda_available
 
-        vals = {**self._asls_settings(), **self._crop_settings()}   # **: dict 합치기
-        dlg = AslsDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self.cube.shape)
+        vals = {**self._asls_settings(), **self._band_settings()}   # **: dict 합치기
+        # 모양은 원본 기준 (지금 화면 큐브는 시작 밴드로 잘려 있을 수 있음)
+        dlg = AslsDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self._orig_data.shape)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         self._store_settings("asls", dlg.values())
-        self._set_proc_ui(True, self.cmb_deriv.currentIndex())
+        self._set_proc_ui(True, self.cmb_deriv.currentIndex(), self._bg)
         self._apply_proc()
 
     def run_deriv(self):
@@ -1152,18 +1188,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         from .baseline import cuda_available
 
-        vals = {**self._deriv_settings(), **self._crop_settings()}
+        vals = {**self._deriv_settings(), **self._band_settings()}
         if self.cmb_deriv.currentIndex() > 0:
             vals["order"] = self.cmb_deriv.currentIndex()
-        dlg = DerivDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self.cube.shape)
+        dlg = DerivDialog(self, vals, "GPU (CUDA)" if cuda_available() else "CPU", self._orig_data.shape)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
         vals = dlg.values()
         self._store_settings("deriv", vals)
-        self._set_proc_ui(self.chk_asls.isChecked(), vals["order"])
+        self._set_proc_ui(self.chk_asls.isChecked(), vals["order"], self._bg)
         self._apply_proc()
 
-    def _set_proc_ui(self, asls_on: bool, deriv_idx: int):
+    def _set_proc_ui(self, asls_on: bool, deriv_idx: int, bg: dict | None):
         """도구 모음 처리 선택을 바꾼다. 시그널을 막아 _apply_proc가 중간에 불리지 않게 한다"""
         for w in (self.chk_asls, self.cmb_deriv):
             w.blockSignals(True)
@@ -1171,56 +1207,103 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_deriv.setCurrentIndex(deriv_idx)
         for w in (self.chk_asls, self.cmb_deriv):
             w.blockSignals(False)
+        self._bg = bg
+        self._update_bg_combo()
 
     @staticmethod
-    def _crop_box(vals: dict, shape: tuple) -> tuple[int, int, int, int]:
-        """대화상자 크롭 값 → (y0, y1, x0, x1). 너비/높이 0이면 큐브 끝까지 (B-098)"""
-        H, W = shape[:2]
-        x0, y0 = min(vals["crop_x"], W - 1), min(vals["crop_y"], H - 1)
-        x1 = W if vals["crop_w"] <= 0 else min(W, x0 + vals["crop_w"])
-        y1 = H if vals["crop_h"] <= 0 else min(H, y0 + vals["crop_h"])
-        return y0, y1, x0, x1
+    def _bg_text(bg: dict) -> str:
+        return f"{bg['label']} ({bg['x']},{bg['y']})" + (f" bin {bg['bin']}" if bg["bin"] > 1 else "")
+
+    def _update_bg_combo(self):
+        """배경 선택 목록 (B-105): '배경 빼기 끔', 지금 쓰는 배경, 그 밖의 포인트들"""
+        cb = self.cmb_bg
+        cb.clear()
+        cb.addItem("배경 빼기 끔", None)
+        if self._bg is not None:
+            cb.addItem("배경 " + self._bg_text(self._bg), "cur")
+        b = self.view_panel.state()["bin"]
+        for i, e in enumerate(self.entries):
+            if e["kind"] != "point":
+                continue
+            bg = self._bg
+            if bg is not None and (bg["label"], bg["x"], bg["y"], bg["bin"]) == (e["label"], e["x"], e["y"], b):
+                continue   # 지금 쓰는 배경과 같은 포인트·bin → 중복 표시 안 함
+            cb.addItem(f"배경 ← {e['label']} ({e['x']},{e['y']})" + (f" bin {b}" if b > 1 else ""), i)
+        cb.setCurrentIndex(1 if self._bg is not None else 0)
+        cb.setEnabled(self.cube is not None)
+
+    def _on_bg_chosen(self, idx: int):
+        d = self.cmb_bg.itemData(idx)
+        if d == "cur":
+            return
+        if d is None:
+            self._bg = None
+        else:
+            e = self.entries[d]
+            b = self.view_panel.state()["bin"]
+            spec, _ = binned_spectrum(self._orig_data, e["x"], e["y"], b)   # 처리 전 원본에서 잰다
+            self._bg = {"label": e["label"], "x": e["x"], "y": e["y"], "bin": b, "spec": spec.astype(np.float32)}
+        self._update_bg_combo()
+        self._apply_proc()
 
     def _apply_proc(self, *_):   # *_: 시그널이 넘기는 값은 쓰지 않고 버린다
-        """AsLS 체크와 미분 선택대로 원본에서 다시 계산해 보여준다 (B-103).
-        켜진 것만 AsLS → 미분 순서. 크롭 범위는 두 처리가 같이 쓰고, 범위 밖은 원본 값 그대로."""
+        """배경 선택, AsLS 체크, 미분 선택대로 원본에서 다시 계산해 보여준다 (B-103, B-105, B-106).
+        켜진 것만 배경 빼기 → AsLS → 미분 순서. 처리가 하나라도 켜지면 시작 밴드 앞은 잘라내고 남은 밴드만 계산."""
         if self.cube is None:
-            self._set_proc_ui(False, 0)
+            self._set_proc_ui(False, 0, None)
             return
         if self._proc_busy:   # 계산 중에 선택이 바뀌면 끝난 뒤 한 번 더 맞춘다
             self._proc_again = True
             return
         from .derivative import check_params
 
+        n_all = self._orig_data.shape[2]
+        b0 = self._band_settings()["band_start"]
+        left = n_all - b0   # 잘라낸 뒤 남는 밴드 수
+        asls_on, order = self.chk_asls.isChecked(), self.cmb_deriv.currentIndex()
+        bg = self._bg
+        if (bg is not None or asls_on or order) and (left <= 0 or (asls_on and left <= 3)):
+            self._set_proc_ui(*self._proc_ui)
+            self._error(f"시작 밴드({b0})가 밴드 수({n_all}) 이상입니다. 설정에서 시작 밴드를 줄이세요." if left <= 0
+                        else f"시작 밴드({b0}) 뒤에 남는 밴드가 {left}개라 AsLS를 할 수 없습니다 (4개 이상 필요).")
+            return
         steps = []   # [(kind, 설정 dict, 처리 내역 글자, 짧은 이름)]
-        if self.chk_asls.isChecked():
+        if bg is not None:   # 설정 dict는 비교용(위치, bin, 방식)만. 실제 스펙트럼은 작업에 따로 넘긴다
+            v = {k: bg[k] for k in ("label", "x", "y", "bin")}
+            v["scale"] = self.proc_opts["bg_scale"].isChecked()
+            v["median"] = v["scale"] and self.proc_opts["bg_median"].isChecked()   # 중앙값은 배율 맞춤일 때만 의미 있음
+            how = ("배율 맞춤" + (", k 3×3 중앙값" if v["median"] else "")) if v["scale"] else "단일"
+            steps.append(("bg", v, f"배경 빼기({how}) " + self._bg_text(bg), "BG"))
+        if asls_on:
             v = self._asls_settings()
-            steps.append(("asls", v, f"AsLS λ=1e{v['lam_exp']:g} p=1e-{v['p_exp']:g} n={v['n_iter']}", "AsLS"))
-        order = self.cmb_deriv.currentIndex()
+            steps.append(("asls", v, f"AsLS λ=1e{v['lam_exp']:g} p=1e-{v['p_exp']:g} n=5", "AsLS"))
         if order:
             v = {**self._deriv_settings(), "order": order}
-            err = check_params(self.cube.n_bands, order, v["window"], v["poly"])
+            err = check_params(left, order, v["window"], v["poly"])   # 잘린 밴드 수 기준
             if err:   # 저장된 윈도우/다항 차수가 이 큐브(또는 차수)에 맞지 않으면 설정 창으로
                 self._set_proc_ui(*self._proc_ui)
                 self.statusBar().showMessage(f"미분 설정을 고치세요: {err}", 6000)
                 self.run_deriv()
                 return
             steps.append(("deriv", v, f"SG {order}차 미분 w={v['window']} p={v['poly']}", f"D{order}"))
-        box = self._crop_box(self._crop_settings(), self.cube.shape) if steps else None
-        key = (tuple((s[0], tuple(sorted(s[1].items()))) for s in steps), box)   # 같은 설정이면 다시 계산 안 함
+        clip = self.proc_opts["clip_neg"].isChecked()
+        if not steps:
+            b0 = 0   # 모두 끔 → 원본 (자르지 않음)
+        # 같은 설정이면 다시 계산 안 함
+        key = (tuple((s[0], tuple(sorted(s[1].items()))) for s in steps), (b0, clip) if steps else None)
         if key == self._proc_key:
             return
-        self._pending_proc = (key, steps, box, (self.chk_asls.isChecked(), order))
+        self._pending_proc = (key, steps, b0, clip, (asls_on, order, bg))
         if not steps:
             self._on_proc_done(None, "")   # 모두 끔 → 계산 없이 원본으로
             return
-        y0, y1, x0, x1 = box
         name = " → ".join(s[3] for s in steps)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
         self.setEnabled(False)
         self.statusBar().showMessage(f"{name} 처리 중…")
         self._proc_busy = True
-        task = _ProcTask([(s[0], s[1]) for s in steps], self._orig_data[y0:y1, x0:x1])   # 원본의 크롭 범위만 처리
+        params = [(s[0], {**s[1], "spec": bg["spec"][b0:]} if s[0] == "bg" else s[1]) for s in steps]
+        task = _ProcTask(params, self._orig_data[:, :, b0:], clip)   # 원본의 시작 밴드부터 끝까지만 처리
         task.signals.progress.connect(lambda d, n: self.statusBar().showMessage(f"{name} 처리 중… {d} / {n} 픽셀"))
         task.signals.done.connect(self._on_proc_done)
         task.signals.failed.connect(self._on_proc_failed)
@@ -1236,37 +1319,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self._error(f"처리 실패:\n{msg}")
 
     def _on_proc_done(self, out: np.ndarray | None, device: str):
-        """out: 크롭 범위 처리 결과 (모두 끔이면 None → 원본)"""
+        """out: 시작 밴드부터 처리한 결과 (H, W, B − 시작 밴드). 모두 끔이면 None → 원본"""
         QtWidgets.QApplication.restoreOverrideCursor()
         self.setEnabled(True)
-        key, steps, box, ui = self._pending_proc
+        key, steps, b0, clip, ui = self._pending_proc
         meta = self.cube.meta
         H, W = self.cube.shape[:2]
-        old_box = self._proc_key[1]
-        if out is None:
-            data = self._orig_data
-        elif box == (0, H, 0, W):
-            data = out
-        else:
-            data = self._orig_data.copy()   # 크롭 밖은 원본 값, 크롭 자리에 결과
-            data[box[0]:box[1], box[2]:box[3]] = out
+        was_processed = bool(self._proc_key[0])
+        old_b0 = meta.get("band_start", 0)
+        data = self._orig_data if out is None else out
         self.cube.data = data
-        meta["processing"] = [s[2] for s in steps]   # 지금 켜진 처리만 (쌓이지 않음)
+        # 파장도 같이 자른다 (has_wavelengths 는 길이가 밴드 수와 같을 때만 참)
+        self.cube.wavelengths = self._orig_wl if self._orig_wl is None else self._orig_wl[b0:]
+        meta["processing"] = [s[2] for s in steps] + (["음수를 0으로"] if steps and clip else [])   # 지금 켜진 처리만
         meta["proc_short"] = [s[3] for s in steps]   # 저장 파일 이름 꼬리용
-        if box is None or box == (0, H, 0, W):
-            meta.pop("crop", None)
+        if b0:
+            meta["band_start"] = b0   # 저장할 때 앞 밴드를 붙일지 정하고, 스펙트럼 X축도 이만큼 잘라 그린다
         else:
-            meta["crop"] = box   # (y0, y1, x0, x1) — 저장할 때 이 범위만 잘라 쓸 수 있다
+            meta.pop("band_start", None)
+        meta.pop("crop", None)
         self._proc_key, self._proc_ui = key, ui
         self._pca_cache = None
         self._last_rgb_key = None
         self.cache.reset(id(data))
+        if b0 != old_b0:   # 밴드 수가 바뀜 → 밴드 선택 범위, R/G/B 번호(같은 원본 밴드를 가리키게 옮김), X축
+            n = data.shape[2]
+            self.view_panel.set_n_bands(n)
+            self.rgb_bands = [int(np.clip(b + old_b0 - b0, 0, n - 1)) for b in self.rgb_bands]
+            self.view_panel.set_bands(self.rgb_bands)
+            self._apply_axis()
+            self.lbl_shape.setText(f"{W} × {H} px · {n} 밴드" + (f" (원본 {b0}번부터)" if b0 else "")
+                                   + f" · {data.nbytes / 1e6:.0f} MB")
         self._update_file_label()
-        # 값이 바뀐 범위 = 전에 처리했던 범위 + 이번 범위 (둘을 감싸는 사각형)
-        boxes = [b for b in (old_box, box) if b is not None]
-        changed = (min(b[0] for b in boxes), max(b[1] for b in boxes),
-                   min(b[2] for b in boxes), max(b[3] for b in boxes)) if boxes else None
-        stale = changed is not None and self._drop_stale_clusters(changed)
+        # 처리는 모든 픽셀에 하므로, 전이나 지금 처리가 켜져 있었으면 큐브 전체 값이 바뀐 것
+        stale = (was_processed or bool(steps)) and self._drop_stale_clusters((0, H, 0, W))
         self._render_base()
         self._refresh_entries()
         if self.seg is not None:
@@ -1278,10 +1364,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._proc_again = False
             self._apply_proc()
 
-    @staticmethod
-    def _crop_text(crop) -> str:
-        y0, y1, x0, x1 = crop
-        return f"크롭 x={x0} y={y0} {x1 - x0}×{y1 - y0}"
+    def _band_text(self, b0: int) -> str:
+        return f"밴드 {b0}~{self._orig_data.shape[2] - 1} (앞 {b0}개 잘림)"
 
     def _update_file_label(self):
         """도구 모음 오른쪽 파일 이름 칸. 짧게 보여주고 전체(경로, 처리 내역)는 툴팁으로 (B-102, B-103)"""
@@ -1291,13 +1375,13 @@ class MainWindow(QtWidgets.QMainWindow):
         shorts = cube.meta.get("proc_short", [])
         tip = cube.path
         if shorts:
-            s = " → ".join(shorts)   # 켜진 처리만이라 많아야 2단계 (AsLS → D1)
-            if "crop" in cube.meta:
-                s += " 크롭"
+            s = " → ".join(shorts)   # 켜진 처리만이라 많아야 3단계 (BG → AsLS → D1)
+            if "band_start" in cube.meta:
+                s += f" {cube.meta['band_start']}~"
             name += f"  ({s})"
             tip += "\n적용 중인 처리 (원본에서 차례로):\n" + "\n".join(
                 f"{i}. {t}" for i, t in enumerate(cube.meta["processing"], 1))
-            tip += "\n범위: " + (self._crop_text(cube.meta["crop"]) if "crop" in cube.meta else "전체")
+            tip += "\n범위: " + (self._band_text(cube.meta["band_start"]) if "band_start" in cube.meta else "전체 밴드")
         self.file_label.setText(name)
         self.file_label.setToolTip(tip)
 
@@ -1329,10 +1413,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._write_cube(path)
 
     def _write_cube(self, path: str):
-        data = self.cube.data
-        crop = self.cube.meta.get("crop")
-        if crop and self.settings.value("proc/save_crop", True, type=bool):
-            data = data[crop[0]:crop[1], crop[2]:crop[3]]   # 처리한 크롭 영역만 저장 (B-098)
+        data, wl = self.cube.data, self.cube.wavelengths
+        b0 = self.cube.meta.get("band_start", 0)
+        whole = bool(b0) and not self.settings.value("proc/save_cut", True, type=bool)
+        if whole:   # '잘린 큐브 저장'을 껐으면 잘라낸 앞 밴드를 원본 값으로 다시 붙인다 (B-106)
+            data = np.concatenate([self._orig_data[:, :, :b0], data], axis=2)
+            wl = self._orig_wl
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.BusyCursor)
         try:
             if path.lower().endswith(".npy"):
@@ -1342,11 +1428,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 # load_cube가 다시 읽는 이름: 'image'(H, W, B), 'wavelength'
                 d = {"image": data}
-                if self.cube.has_wavelengths:
-                    d["wavelength"] = np.asarray(self.cube.wavelengths, np.float32)
+                if wl is not None and len(wl) == data.shape[2]:
+                    d["wavelength"] = np.asarray(wl, np.float32)
                 if self.cube.meta.get("processing"):
                     d["processing"] = " → ".join(self.cube.meta["processing"]) + (
-                        ", " + self._crop_text(crop) if crop else "")
+                        ", " + self._band_text(b0) + (" — 앞 밴드는 원본 값으로 붙임" if whole else "") if b0 else "")
                 sio.savemat(path, d)
             self.statusBar().showMessage(f"큐브 저장됨 → {path}", 4000)
         except Exception as e:  # noqa: BLE001
